@@ -138,6 +138,11 @@ class JitStaticOutputs:
 
 jax.tree_util.register_static(JitStaticOutputs)
 
+def _default_constrain_object_state(state: State) -> State:
+  state_spec = spmd.get_partition_spec(state)
+  state = jax.lax.with_sharding_constraint(state, state_spec)
+  return state
+
 
 @dataclasses.dataclass
 class JITOptions:
@@ -152,7 +157,9 @@ class JITOptions:
   backend: tp.Optional[str]
   inline: bool
   abstracted_axes: tp.Optional[tp.Any]
+  # nnx specific
   donate_object_state: bool
+  constrain_object_state: tp.Callable[[State], State] | None
 
   @classmethod
   def from_jit_kwargs(
@@ -169,6 +176,7 @@ class JITOptions:
     inline: bool,
     abstracted_axes: tp.Optional[tp.Any],
     donate_object_state: bool,
+    constrain_object_state: bool | tp.Callable[[State], State],
   ):
     _static_argnums = _normalize_sequence(static_argnums)
     _static_argnames = _normalize_sequence(static_argnames)
@@ -177,6 +185,13 @@ class JITOptions:
 
     if donate_object_state:
       _donate_argnames = (*_donate_argnames, '_nnx_jit_state')
+
+    if callable(constrain_object_state):
+      _constrain_object_state = constrain_object_state
+    elif constrain_object_state:
+      _constrain_object_state = _default_constrain_object_state
+    else:
+      _constrain_object_state = None
 
     return cls(
       in_shardings=in_shardings,
@@ -191,11 +206,13 @@ class JITOptions:
       inline=inline,
       abstracted_axes=abstracted_axes,
       donate_object_state=donate_object_state,
+      constrain_object_state=_constrain_object_state,
     )
 
   def get_jit_kwargs(self) -> dict[str, tp.Any]:
     kwargs = vars(self).copy()
     del kwargs['donate_object_state']
+    del kwargs['constrain_object_state']
     if kwargs['in_shardings'] is UNSPECIFIED:
       kwargs.pop('in_shardings')
     if kwargs['out_shardings'] is UNSPECIFIED:
@@ -219,6 +236,9 @@ class JITMeta(ModuleMeta):
     backend: tp.Optional[str] = None,
     inline: bool = False,
     abstracted_axes: tp.Optional[tp.Any] = None,
+    # nnx specific
+    donate_object_state: bool = False,
+    constrain_object_state: bool | tp.Callable[[State], State] = False,
   ) -> tp.Callable[..., 'JIT[M]']:
     super_call = super().__call__
 
@@ -237,6 +257,8 @@ class JITMeta(ModuleMeta):
         backend=backend,
         inline=inline,
         abstracted_axes=abstracted_axes,
+        # nnx specific
+        donate_object_state=donate_object_state,
         # submodule args
         module_init_args=args,
         module_init_kwargs=kwargs,
@@ -267,7 +289,10 @@ def get_jitted_fn(f, options: JITOptions) -> JittedFn:
     **kwargs: tp.Any,
   ):
     graphdef = _nnx_jit_static.graphdef
-    state = _nnx_jit_state
+    state: State = _nnx_jit_state
+
+    if options.constrain_object_state is not None:
+      state = options.constrain_object_state(state)
 
     input_graph_nodes, outer_idx_inner_ref = graph_utils.graph_unflatten(
       graphdef, state
@@ -287,6 +312,10 @@ def get_jitted_fn(f, options: JITOptions) -> JittedFn:
     outer_idx_inner_idx = graph_utils.compose_mapping(
       outer_idx_inner_ref, inner_ref_inner_idx
     )
+
+    if options.constrain_object_state is not None:
+      state = options.constrain_object_state(state)
+
     output_static = JitStaticOutputs(graphdef, outer_idx_inner_idx)
     out = (out, state, output_static)
     return out
@@ -343,10 +372,12 @@ class JIT(LiftedModule[M], metaclass=JITMeta):
     backend: tp.Optional[str] = None,
     inline: bool = False,
     abstracted_axes: tp.Optional[tp.Any] = None,
+    # nnx specific
+    donate_object_state: bool = False,
+    constrain_object_state: bool | tp.Callable[[State], State] = False,
     # submodule args
     module_init_args: tuple[tp.Any, ...],
     module_init_kwargs: dict[str, tp.Any],
-    donate_object_state: bool = False,
   ):
     self.options = JITOptions.from_jit_kwargs(
       in_shardings=in_shardings,
@@ -361,6 +392,7 @@ class JIT(LiftedModule[M], metaclass=JITMeta):
       inline=inline,
       abstracted_axes=abstracted_axes,
       donate_object_state=donate_object_state,
+      constrain_object_state=constrain_object_state,
     )
     self.accessor: tp.Optional[DelayedAccessor] = None
 
@@ -404,12 +436,10 @@ def jit(
   backend: tp.Optional[str] = None,
   inline: bool = False,
   abstracted_axes: tp.Optional[tp.Any] = None,
-  is_init: tp.Optional[bool] = None,
+  # nnx specific
   donate_object_state: bool = False,
+  constrain_object_state: bool | tp.Callable[[State], State] = False,
 ) -> F:
-  if is_init is None:
-    is_init = f.__name__ == '__init__'
-
   options = JITOptions.from_jit_kwargs(
     in_shardings=in_shardings,
     out_shardings=out_shardings,
@@ -423,6 +453,7 @@ def jit(
     inline=inline,
     abstracted_axes=abstracted_axes,
     donate_object_state=donate_object_state,
+    constrain_object_state=constrain_object_state,
   )
   jitted_fn = get_jitted_fn(f, options)
 
